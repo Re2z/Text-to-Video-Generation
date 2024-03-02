@@ -1,16 +1,3 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,6 +14,7 @@ from diffusers.models.embeddings import PatchEmbed, ImagePositionalEmbeddings
 from diffusers.models.attention import FeedForward, AdaLayerNorm, AdaLayerNormZero
 from diffusers.models.cross_attention import CrossAttention
 from diffusers.utils import BaseOutput, deprecate
+from models.mid_spatial_attention import SpatialAttention
 import xformers
 
 
@@ -64,6 +52,7 @@ class BasicTransformerBlock(nn.Module):
             final_dropout: bool = False,
             prepend_first_frame: bool = False,
             add_temp_embed: bool = False,
+            add_spatial_attn: bool = False,
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
@@ -78,6 +67,7 @@ class BasicTransformerBlock(nn.Module):
             )
 
         self.add_temp_embed = add_temp_embed
+        self.add_spatial_attn = add_spatial_attn
 
         if prepend_first_frame:
             # SC-Attn
@@ -105,6 +95,24 @@ class BasicTransformerBlock(nn.Module):
                 bias=attention_bias,
                 upcast_attention=upcast_attention,
             )
+
+        # Spatial-Attn
+        self.spatial_norm = (
+            AdaLayerNorm(dim, num_embeds_ada_norm)
+            if self.use_ada_layer_norm
+            else nn.LayerNorm(dim)
+        )
+
+        self.spatial_attn = SpatialAttention(
+            query_dim=dim,
+            heads=num_attention_heads,
+            dim_head=attention_head_dim,
+            dropout=dropout,
+            bias=attention_bias,
+            upcast_attention=upcast_attention,
+        )
+        zero_module(self.spatial_attn.to_out)
+
         # Temp-Attn
         self.temp_norm = (
             AdaLayerNorm(dim, num_embeds_ada_norm)
@@ -206,6 +214,27 @@ class BasicTransformerBlock(nn.Module):
             )
             hidden_states = attn_output + hidden_states
 
+        # spatial_attn
+        if self.spatial_attn is not None:
+            identity = hidden_states
+            d = hidden_states.shape[1]
+            # normalization
+            hidden_states = rearrange(
+                hidden_states, "(b f) d c -> (b d) f c", f=video_length
+            )
+            norm_hidden_states = (
+                self.spatial_norm(hidden_states, timestep)
+                if self.use_ada_layer_norm
+                else self.spatial_norm(hidden_states)
+            )
+            # apply temporal attention
+            hidden_states = self.spatial_attn(norm_hidden_states) + hidden_states
+            hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
+            # ignore effects of temporal layers on image inputs
+            if video_length <= 1:
+                hidden_states = identity + 0.0 * hidden_states
+
+        # temp_attn
         if self.temp_attn is not None:
             identity = hidden_states
             d = hidden_states.shape[1]

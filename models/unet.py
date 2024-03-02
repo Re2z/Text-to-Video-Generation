@@ -1,16 +1,3 @@
-# Copyright 2023 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -117,7 +104,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                     "CrossAttnDownBlock2D",
                     "DownBlock2D",
             ),
-            mid_block_type: Optional[str] = "UNetMidBlock2DCrossAttn",
+            mid_block_type: Optional[str] = "UNetMidBlock3DCrossAttn",
             up_block_types: Tuple[str] = (
                     "UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
             only_cross_attention: Union[bool, Tuple[bool]] = False,
@@ -267,7 +254,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             self.down_blocks.append(down_block)
 
         # mid
-        if mid_block_type == "UNetMidBlock2DCrossAttn":
+        if mid_block_type == "UNetMidBlock3DCrossAttn":
             self.mid_block = UNetMidBlock3DCrossAttn(
                 in_channels=block_out_channels[-1],
                 temb_channels=time_embed_dim,
