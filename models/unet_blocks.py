@@ -93,6 +93,7 @@ class UNetMidBlock3DCrossAttn(nn.Module):
             )
         ]
         attentions = []
+
         if add_temp_conv:
             self.temp_convs = None
             temp_convs = [TemporalConvLayer(in_channels, in_channels, dropout=0.1)]

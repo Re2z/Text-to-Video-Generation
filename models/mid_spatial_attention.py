@@ -261,8 +261,8 @@ class SpatialAttnProcessor:
             self,
             attn: SpatialAttention,
             hidden_states,
-            last_frame_hidden_states,
-            next_frame_hidden_states,
+            last_frame_hidden_states=None,
+            next_frame_hidden_states=None,
             encoder_hidden_states=None,
             attention_mask=None,
     ):
@@ -273,8 +273,12 @@ class SpatialAttnProcessor:
         last_frame_encoder_hidden_states = last_frame_hidden_states
         next_frame_encoder_hidden_states = next_frame_hidden_states
 
-        key = attn.to_k(last_frame_encoder_hidden_states)
-        value = attn.to_v(next_frame_encoder_hidden_states)
+        if last_frame_hidden_states is None and next_frame_hidden_states is None:
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
+        else:
+            key = attn.to_k(last_frame_encoder_hidden_states)
+            value = attn.to_v(next_frame_encoder_hidden_states)
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)

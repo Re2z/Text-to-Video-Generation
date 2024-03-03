@@ -1,4 +1,3 @@
-
 from typing import Optional
 
 import torch
@@ -18,16 +17,6 @@ class InflatedConv3d(nn.Conv2d):
 
 
 class Upsample3D(nn.Module):
-    """
-    An upsampling layer with an optional convolution.
-
-    Parameters:
-        channels: channels in the inputs and outputs.
-        use_conv: a bool determining if a convolution is applied.
-        use_conv_transpose:
-        out_channels:
-    """
-
     def __init__(self, channels, use_conv=False, use_conv_transpose=False, out_channels=None, name="conv"):
         super().__init__()
         self.channels = channels
@@ -42,7 +31,6 @@ class Upsample3D(nn.Module):
         elif use_conv:
             conv = InflatedConv3d(self.channels, self.out_channels, 3, padding=1)
 
-        # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if name == "conv":
             self.conv = conv
         else:
@@ -55,7 +43,6 @@ class Upsample3D(nn.Module):
             return self.conv(hidden_states)
 
         # Cast to float32 to as 'upsample_nearest2d_out_frame' op does not support bfloat16
-        # TODO(Suraj): Remove this cast once the issue is fixed in PyTorch
         # https://github.com/pytorch/pytorch/issues/86679
         dtype = hidden_states.dtype
         if dtype == torch.bfloat16:
@@ -76,7 +63,6 @@ class Upsample3D(nn.Module):
         if dtype == torch.bfloat16:
             hidden_states = hidden_states.to(dtype)
 
-        # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if self.use_conv:
             if self.name == "conv":
                 hidden_states = self.conv(hidden_states)
@@ -87,16 +73,6 @@ class Upsample3D(nn.Module):
 
 
 class Downsample3D(nn.Module):
-    """
-    A downsampling layer with an optional convolution.
-
-    Parameters:
-        channels: channels in the inputs and outputs.
-        use_conv: a bool determining if a convolution is applied.
-        out_channels:
-        padding:
-    """
-
     def __init__(self, channels, use_conv=False, out_channels=None, padding=1, name="conv"):
         super().__init__()
         self.channels = channels
@@ -112,7 +88,6 @@ class Downsample3D(nn.Module):
             assert self.channels == self.out_channels
             conv = nn.AvgPool2d(kernel_size=stride, stride=stride)
 
-        # TODO(Suraj, Patrick) - clean up after weight dicts are correctly renamed
         if name == "conv":
             self.Conv2d_0 = conv
             self.conv = conv
@@ -134,36 +109,6 @@ class Downsample3D(nn.Module):
 
 
 class ResnetBlock3D(nn.Module):
-    r"""
-    A Resnet block.
-
-    Parameters:
-        in_channels (`int`): The number of channels in the input.
-        out_channels (`int`, *optional*, default to be `None`):
-            The number of output channels for the first conv2d layer. If None, same as `in_channels`.
-        dropout (`float`, *optional*, defaults to `0.0`): The dropout probability to use.
-        temb_channels (`int`, *optional*, default to `512`): the number of channels in timestep embedding.
-        groups (`int`, *optional*, default to `32`): The number of groups to use for the first normalization layer.
-        groups_out (`int`, *optional*, default to None):
-            The number of groups to use for the second normalization layer. if set to None, same as `groups`.
-        eps (`float`, *optional*, defaults to `1e-6`): The epsilon to use for the normalization.
-        non_linearity (`str`, *optional*, default to `"swish"`): the activation function to use.
-        time_embedding_norm (`str`, *optional*, default to `"default"` ): Time scale shift config.
-            By default, apply timestep embedding conditioning with a simple shift mechanism. Choose "scale_shift" or
-            "ada_group" for a stronger conditioning with scale and shift.
-        kernal (`torch.FloatTensor`, optional, default to None): FIR filter, see
-            [`~models.resnet.FirUpsample2D`] and [`~models.resnet.FirDownsample2D`].
-        output_scale_factor (`float`, *optional*, default to be `1.0`): the scale factor to use for the output.
-        use_in_shortcut (`bool`, *optional*, default to `True`):
-            If `True`, add a 1x1 nn.conv2d layer for skip-connection.
-        up (`bool`, *optional*, default to `False`): If `True`, add an upsample layer.
-        down (`bool`, *optional*, default to `False`): If `True`, add a downsample layer.
-        conv_shortcut_bias (`bool`, *optional*, default to `True`):  If `True`, adds a learnable bias to the
-            `conv_shortcut` output.
-        conv_2d_out_channels (`int`, *optional*, default to `None`): the number of channels in the output.
-            If None, same as `out_channels`.
-    """
-
     def __init__(
             self,
             *,
@@ -202,7 +147,7 @@ class ResnetBlock3D(nn.Module):
 
         self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
 
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv1 = InflatedConv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if temb_channels is not None:
             if self.time_embedding_norm == "default":
@@ -217,7 +162,6 @@ class ResnetBlock3D(nn.Module):
             self.time_emb_proj = None
 
         self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
-
         self.dropout = torch.nn.Dropout(dropout)
         conv_2d_out_channels = conv_2d_out_channels or out_channels
         self.conv2 = InflatedConv3d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
@@ -241,15 +185,13 @@ class ResnetBlock3D(nn.Module):
 
         self.conv_shortcut = None
         if self.use_in_shortcut:
-            self.conv_shortcut = torch.nn.Conv2d(
+            self.conv_shortcut = InflatedConv3d(
                 in_channels, conv_2d_out_channels, kernel_size=1, stride=1, padding=0, bias=conv_shortcut_bias
             )
 
     def forward(self, input_tensor, temb):
         hidden_states = input_tensor
-
         hidden_states = self.norm1(hidden_states)
-
         hidden_states = self.nonlinearity(hidden_states)
 
         if self.upsample is not None:
@@ -278,7 +220,6 @@ class ResnetBlock3D(nn.Module):
             hidden_states = hidden_states * (1 + scale) + shift
 
         hidden_states = self.nonlinearity(hidden_states)
-
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states)
 
