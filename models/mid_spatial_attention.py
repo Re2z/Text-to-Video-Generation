@@ -45,7 +45,6 @@ class SpatialAttention(nn.Module):
             cross_attention_norm: bool = False,
             added_kv_proj_dim: Optional[int] = None,
             norm_num_groups: Optional[int] = None,
-            processor: Optional["AttnProcessor"] = None,
     ):
         super().__init__()
         inner_dim = dim_head * heads
@@ -168,7 +167,8 @@ class SpatialAttention(nn.Module):
 
         self.processor = processor
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
+    def forward(self, hidden_states, encoder_hidden_states=None, last_frame_hidden_states=None,
+            next_frame_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
         # The `CrossAttention` class can call different attention processors / attention functions
         # here we simply pass along all tensors to the selected processor class
         # For standard processors that are defined here, `**cross_attention_kwargs` is empty
@@ -176,6 +176,8 @@ class SpatialAttention(nn.Module):
             self,
             hidden_states,
             encoder_hidden_states=encoder_hidden_states,
+            last_frame_hidden_states=last_frame_hidden_states,
+            next_frame_hidden_states=next_frame_hidden_states,
             attention_mask=attention_mask,
             **cross_attention_kwargs,
         )

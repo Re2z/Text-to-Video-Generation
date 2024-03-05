@@ -38,7 +38,6 @@ class BasicTransformerBlock(nn.Module):
             norm_elementwise_affine: bool = True,
             norm_type: str = "layer_norm",
             final_dropout: bool = False,
-            prepend_first_frame: bool = False,
             add_temp_embed: bool = False,
             add_spatial_attn: bool = False,
     ):
@@ -137,6 +136,8 @@ class BasicTransformerBlock(nn.Module):
             timestep=None,
             attention_mask=None,
             cross_attention_kwargs=None,
+            last_frame_hidden_states=None,
+            next_frame_hidden_states=None,
             video_length=None,
     ):
         if self.use_ada_layer_norm:
@@ -185,7 +186,8 @@ class BasicTransformerBlock(nn.Module):
                 else self.spatial_norm(hidden_states)
             )
             # apply temporal attention
-            hidden_states = self.spatial_attn(norm_hidden_states) + hidden_states
+            hidden_states = self.spatial_attn(norm_hidden_states, last_frame_hidden_states,
+                                              next_frame_hidden_states) + hidden_states
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
             # ignore effects of temporal layers on image inputs
             if video_length <= 1:
@@ -247,9 +249,6 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             norm_num_groups: int = 32,
             cross_attention_dim: Optional[int] = None,
             attention_bias: bool = False,
-            sample_size: Optional[int] = None,
-            num_vector_embeds: Optional[int] = None,
-            patch_size: Optional[int] = None,
             activation_fn: str = "geglu",
             num_embeds_ada_norm: Optional[int] = None,
             use_linear_projection: bool = False,
@@ -308,6 +307,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             self,
             hidden_states,
             encoder_hidden_states=None,
+            last_frame_hidden_states=None,
+            next_frame_hidden_states=None,
             timestep=None,
             class_labels=None,
             cross_attention_kwargs=None,
@@ -342,6 +343,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep,
+                last_frame_hidden_states=last_frame_hidden_states,
+                next_frame_hidden_states=next_frame_hidden_states,
                 cross_attention_kwargs=cross_attention_kwargs,
                 class_labels=class_labels,
                 video_length=video_length,
