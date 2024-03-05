@@ -111,7 +111,6 @@ class UNetMidBlock3DCrossAttn(nn.Module):
                         norm_num_groups=resnet_groups,
                         use_linear_projection=use_linear_projection,
                         upcast_attention=upcast_attention,
-                        add_temp_attn=add_temp_attn,
                         prepend_first_frame=prepend_first_frame,
                         add_temp_embed=add_temp_embed,
                     )

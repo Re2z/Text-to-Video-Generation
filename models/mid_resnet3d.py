@@ -147,7 +147,7 @@ class ResnetBlock3D(nn.Module):
 
         self.norm1 = torch.nn.GroupNorm(num_groups=groups, num_channels=in_channels, eps=eps, affine=True)
 
-        self.conv1 = InflatedConv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv1_3d = InflatedConv3d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if temb_channels is not None:
             if self.time_embedding_norm == "default":
@@ -164,7 +164,7 @@ class ResnetBlock3D(nn.Module):
         self.norm2 = torch.nn.GroupNorm(num_groups=groups_out, num_channels=out_channels, eps=eps, affine=True)
         self.dropout = torch.nn.Dropout(dropout)
         conv_2d_out_channels = conv_2d_out_channels or out_channels
-        self.conv2 = InflatedConv3d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv2_3d = InflatedConv3d(out_channels, conv_2d_out_channels, kernel_size=3, stride=1, padding=1)
 
         if non_linearity == "swish":
             self.nonlinearity = lambda x: F.silu(x)
@@ -205,7 +205,7 @@ class ResnetBlock3D(nn.Module):
             input_tensor = self.downsample(input_tensor)
             hidden_states = self.downsample(hidden_states)
 
-        hidden_states = self.conv1(hidden_states)
+        hidden_states = self.conv1_3d(hidden_states)
 
         if self.time_emb_proj is not None:
             temb = self.time_emb_proj(self.nonlinearity(temb))[:, :, None, None]
@@ -221,7 +221,7 @@ class ResnetBlock3D(nn.Module):
 
         hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.conv2(hidden_states)
+        hidden_states = self.conv2_3d(hidden_states)
 
         if self.conv_shortcut is not None:
             input_tensor = self.conv_shortcut(input_tensor)

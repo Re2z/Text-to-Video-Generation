@@ -4,8 +4,8 @@ import numpy as np
 import torch
 import torchvision
 import imageio
-from einops import rearrange
 from PIL import Image
+from tqdm import tqdm
 
 
 def add_watermark(image, watermark_path, wm_rel_size=1 / 16, boundary=5):
@@ -54,89 +54,60 @@ def create_video(frames, fps, rescale=False, path=None, watermark=None):
     return path
 
 
-class CrossFrameAttnProcessor:
-    def __init__(self, unet_chunk_size=2):
-        self.unet_chunk_size = unet_chunk_size
+# DDIM Inversion
+@torch.no_grad()
+def init_prompt(prompt, pipeline):
+    uncond_input = pipeline.tokenizer(
+        [""], padding="max_length", max_length=pipeline.tokenizer.model_max_length,
+        return_tensors="pt"
+    )
+    uncond_embeddings = pipeline.text_encoder(uncond_input.input_ids.to(pipeline.device))[0]
+    text_input = pipeline.tokenizer(
+        [prompt],
+        padding="max_length",
+        max_length=pipeline.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_embeddings = pipeline.text_encoder(text_input.input_ids.to(pipeline.device))[0]
+    context = torch.cat([uncond_embeddings, text_embeddings])
 
-    def __call__(
-            self,
-            attn,
-            hidden_states,
-            encoder_hidden_states=None,
-            attention_mask=None):
-        batch_size, sequence_length, _ = hidden_states.shape
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
-        query = attn.to_q(hidden_states)
+    return context
 
-        is_cross_attention = encoder_hidden_states is not None
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.cross_attention_norm:
-            encoder_hidden_states = attn.norm_cross(encoder_hidden_states)
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
-        # Sparse Attention
-        if not is_cross_attention:
-            video_length = key.size()[0] // self.unet_chunk_size
-            # former_frame_index = torch.arange(video_length) - 1
-            # former_frame_index[0] = 0
-            former_frame_index = [0] * video_length
-            key = rearrange(key, "(b f) d c -> b f d c", f=video_length)
-            key = key[:, former_frame_index]
-            key = rearrange(key, "b f d c -> (b f) d c")
-            value = rearrange(value, "(b f) d c -> b f d c", f=video_length)
-            value = value[:, former_frame_index]
-            value = rearrange(value, "b f d c -> (b f) d c")
 
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
+def next_step(model_output: Union[torch.FloatTensor, np.ndarray], timestep: int,
+              sample: Union[torch.FloatTensor, np.ndarray], ddim_scheduler):
+    timestep, next_timestep = min(
+        timestep - ddim_scheduler.config.num_train_timesteps // ddim_scheduler.num_inference_steps, 999), timestep
+    alpha_prod_t = ddim_scheduler.alphas_cumprod[timestep] if timestep >= 0 else ddim_scheduler.final_alpha_cumprod
+    alpha_prod_t_next = ddim_scheduler.alphas_cumprod[next_timestep]
+    beta_prod_t = 1 - alpha_prod_t
+    next_original_sample = (sample - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+    next_sample_direction = (1 - alpha_prod_t_next) ** 0.5 * model_output
+    next_sample = alpha_prod_t_next ** 0.5 * next_original_sample + next_sample_direction
+    return next_sample
 
-        attention_probs = attn.get_attention_scores(query, key, attention_mask)
-        hidden_states = torch.bmm(attention_probs, value)
-        hidden_states = attn.batch_to_head_dim(hidden_states)
 
-        # linear proj
-        hidden_states = attn.to_out[0](hidden_states)
-        # dropout
-        hidden_states = attn.to_out[1](hidden_states)
-
-        return hidden_states
+def get_noise_pred_single(latents, t, context, unet):
+    noise_pred = unet(latents, t, encoder_hidden_states=context)["sample"]
+    return noise_pred
 
 
 @torch.no_grad()
-def compute_clip_score(
-        model, model_processor, images, texts, local_bs=32, rescale=False
-):
-    if rescale:
-        images = (images + 1.0) / 2.0  # -1,1 -> 0,1
-    images = (images * 255).to(torch.uint8)
-    clip_scores = []
-    for start_idx in range(0, images.shape[0], local_bs):
-        img_batch = images[start_idx: start_idx + local_bs]
-        batch_size = img_batch.shape[0]  # shape: [b c t h w]
-        img_batch = rearrange(img_batch, "b c t h w -> (b t) c h w")
-        outputs = []
-        for i in range(len(img_batch)):
-            images_part = img_batch[i: i + 1]
-            model_inputs = model_processor(
-                text=texts, images=list(images_part), return_tensors="pt", padding=True
-            )
-            model_inputs = {
-                k: v.to(device=model.device, dtype=model.dtype)
-                if k in ["pixel_values"]
-                else v.to(device=model.device)
-                for k, v in model_inputs.items()
-            }
-            logits = model(**model_inputs)["logits_per_image"]
-            # For consistency with `torchmetrics.functional.multimodal.clip_score`.
-            logits = logits / model.logit_scale.exp()
-            outputs.append(logits)
-        logits = torch.cat(outputs)
-        logits = rearrange(logits, "(b t) p -> t b p", b=batch_size)
-        frame_sims = []
-        for logit in logits:
-            frame_sims.append(logit.diagonal())
-        frame_sims = torch.stack(frame_sims)  # [t, b]
-        clip_scores.append(frame_sims.mean(dim=0))
-    return torch.cat(clip_scores)
+def ddim_loop(pipeline, ddim_scheduler, latent, num_inv_steps, prompt):
+    context = init_prompt(prompt, pipeline)
+    uncond_embeddings, cond_embeddings = context.chunk(2)
+    all_latent = [latent]
+    latent = latent.clone().detach()
+    for i in tqdm(range(num_inv_steps)):
+        t = ddim_scheduler.timesteps[len(ddim_scheduler.timesteps) - i - 1]
+        noise_pred = get_noise_pred_single(latent, t, cond_embeddings, pipeline.unet)
+        latent = next_step(noise_pred, t, latent, ddim_scheduler)
+        all_latent.append(latent)
+    return all_latent
+
+
+@torch.no_grad()
+def ddim_inversion(pipeline, ddim_scheduler, video_latent, num_inv_steps, prompt=""):
+    ddim_latents = ddim_loop(pipeline, ddim_scheduler, video_latent, num_inv_steps, prompt)
+    return ddim_latents

@@ -2,6 +2,7 @@ from typing import Callable, Optional, Union
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from torch import nn
 
 from diffusers.utils import deprecate, logging
@@ -276,6 +277,16 @@ class SpatialAttnProcessor:
         if last_frame_hidden_states is None and next_frame_hidden_states is None:
             key = attn.to_k(encoder_hidden_states)
             value = attn.to_v(encoder_hidden_states)
+            video_length = key.size()[0] // self.unet_chunk_size
+            # former_frame_index = torch.arange(video_length) - 1
+            # former_frame_index[0] = 0
+            former_frame_index = [0] * video_length
+            key = rearrange(key, "(b f) d c -> b f d c", f=video_length)
+            key = key[:, former_frame_index]
+            key = rearrange(key, "b f d c -> (b f) d c")
+            value = rearrange(value, "(b f) d c -> b f d c", f=video_length)
+            value = value[:, former_frame_index]
+            value = rearrange(value, "b f d c -> (b f) d c")
         else:
             key = attn.to_k(last_frame_encoder_hidden_states)
             value = attn.to_v(next_frame_encoder_hidden_states)

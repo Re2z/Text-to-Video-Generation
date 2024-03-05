@@ -16,17 +16,18 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, DDIMScheduler
+from diffusers import AutoencoderKL
+from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-
+from utils import ddim_inversion
 from models.unet import UNet3DConditionModel
 from data.dataset import TextToVideoDataset
 from text_to_video_pipeline import TextToVideoPipeline
-from util import save_videos_grid, ddim_inversion
+from utils import create_video
 from einops import rearrange
 
 
@@ -43,9 +44,10 @@ def main(
     validation_data: Dict,
     validation_steps: int = 100,
     trainable_modules: Tuple[str] = (
-        "attn1.to_q",
-        "attn2.to_q",
-        "attn_temp",
+        "spatial_attn",
+        "temp_attn",
+        "conv1_3d",
+        "conv2_3d"
     ),
     train_batch_size: int = 1,
     max_train_steps: int = 500,
@@ -102,7 +104,7 @@ def main(
         OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
+    noise_scheduler = KarrasDiffusionSchedulers.from_pretrained(pretrained_model_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
@@ -154,7 +156,7 @@ def main(
     )
 
     # Get the training dataset
-    train_dataset = TuneAVideoDataset(**train_data)
+    train_dataset = TextToVideoDataset(**train_data)
 
     # Preprocessing the dataset
     train_dataset.prompt_ids = tokenizer(
@@ -167,12 +169,12 @@ def main(
     )
 
     # Get the validation pipeline
-    validation_pipeline = TuneAVideoPipeline(
+    validation_pipeline = TextToVideoPipeline(
         vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
-        scheduler=DDIMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
+        scheduler=KarrasDiffusionSchedulers.from_pretrained(pretrained_model_path, subfolder="scheduler")
     )
     validation_pipeline.enable_vae_slicing()
-    ddim_inv_scheduler = DDIMScheduler.from_pretrained(pretrained_model_path, subfolder='scheduler')
+    ddim_inv_scheduler = KarrasDiffusionSchedulers.from_pretrained(pretrained_model_path, subfolder='scheduler')
     ddim_inv_scheduler.set_timesteps(validation_data.num_inv_steps)
 
     # Scheduler
@@ -206,9 +208,9 @@ def main(
     num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
+    # The trackers initialize automatically on the main process.
     if accelerator.is_main_process:
-        accelerator.init_trackers("text2video-fine-tune")
+        accelerator.init_trackers("text2video")
 
     # Train!
     total_batch_size = train_batch_size * accelerator.num_processes * gradient_accumulation_steps
@@ -331,11 +333,11 @@ def main(
                         for idx, prompt in enumerate(validation_data.prompts):
                             sample = validation_pipeline(prompt, generator=generator, latents=ddim_inv_latent,
                                                          **validation_data).videos
-                            save_videos_grid(sample, f"{output_dir}/samples/sample-{global_step}/{prompt}.gif")
+                            create_video(sample, f"{output_dir}/samples/sample-{global_step}/{prompt}.gif")
                             samples.append(sample)
                         samples = torch.concat(samples)
                         save_path = f"{output_dir}/samples/sample-{global_step}.gif"
-                        save_videos_grid(samples, save_path)
+                        create_video(samples, save_path)
                         logger.info(f"Saved samples to {save_path}")
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -348,7 +350,7 @@ def main(
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = accelerator.unwrap_model(unet)
-        pipeline = TuneAVideoPipeline.from_pretrained(
+        pipeline = TextToVideoPipeline.from_pretrained(
             pretrained_model_path,
             text_encoder=text_encoder,
             vae=vae,
