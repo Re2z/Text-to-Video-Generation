@@ -122,7 +122,6 @@ class Model:
     def process_text2video(self,
                            prompt,
                            model_name="runwayml/stable-diffusion-v1-5",
-                           # runwayml/stable-diffusion-v1-5,prompthero/openjourney,dreamlike-art/dreamlike-diffusion-1.0,CompVis/stable-diffusion-v1-4, dreamlike-art/dreamlike-photoreal-2.0
                            motion_field_strength_x=12,
                            motion_field_strength_y=12,
                            t0=44,
