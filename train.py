@@ -17,17 +17,16 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DPMSolverMultistepScheduler
-from diffusers.schedulers import KarrasDiffusionSchedulers
+from diffusers import AutoencoderKL, DPMSolverMultistepScheduler, DDPMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils.import_utils import is_xformers_available
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from process_data.dataset import CachedDataset, VideoJsonDataset, SingleVideoDataset, VideoFolderDataset
+from process_data.dataset import VideoFolderDataset
 from models.unet import UNet3DConditionModel
 from text_to_video_pipeline import TextToVideoPipeline
-from utils import create_video
+from utils import save_videos_grid
 from einops import rearrange
 
 already_printed_trainables = False
@@ -38,7 +37,7 @@ def get_train_dataset(dataset_types, train_data, tokenizer):
     train_datasets = []
 
     # Loop through all available datasets, get the name, then add to list of data to process.
-    for DataSet in [VideoJsonDataset, SingleVideoDataset, VideoFolderDataset]:
+    for DataSet in [VideoFolderDataset]:
         for dataset in dataset_types:
             if dataset == DataSet.__getname__():
                 train_datasets.append(DataSet(**train_data, tokenizer=tokenizer))
@@ -51,54 +50,6 @@ def get_train_dataset(dataset_types, train_data, tokenizer):
 
 def unet_and_text_g_c(unet, unet_enable):
     unet._set_gradient_checkpointing(value=unet_enable)
-
-
-def handle_cache_latents(
-        should_cache,
-        output_dir,
-        train_dataloader,
-        train_batch_size,
-        vae,
-        cached_latent_dir=None,
-        shuffle=False
-):
-    # Cache latents by storing them in VRAM.
-    # Speeds up training and saves memory by not encoding during the train loop.
-    if not should_cache: return None
-    vae.to('cuda', dtype=torch.float16)
-    vae.enable_slicing()
-
-    cached_latent_dir = (
-        os.path.abspath(cached_latent_dir) if cached_latent_dir is not None else None
-    )
-    if cached_latent_dir is None:
-        cache_save_dir = f"{output_dir}/cached_latents"
-        os.makedirs(cache_save_dir, exist_ok=True)
-
-        for i, batch in enumerate(tqdm(train_dataloader, desc="Caching Latents.")):
-
-            save_name = f"cached_{i}"
-            full_out_path = f"{cache_save_dir}/{save_name}.pt"
-
-            pixel_values = batch['pixel_values'].to('cuda', dtype=torch.float16)
-            batch['pixel_values'] = tensor_to_vae_latent(pixel_values, vae)
-            for k, v in batch.items(): batch[k] = v[0]
-
-            torch.save(batch, full_out_path)
-            del pixel_values
-            del batch
-
-            # We do this to avoid fragmentation from casting latents between devices.
-            torch.cuda.empty_cache()
-    else:
-        cache_save_dir = cached_latent_dir
-
-    return torch.utils.data.DataLoader(
-        CachedDataset(cache_dir=cache_save_dir),
-        batch_size=train_batch_size,
-        shuffle=shuffle,
-        num_workers=0
-    )
 
 
 def tensor_to_vae_latent(t, vae):
@@ -125,8 +76,7 @@ def sample_noise(latents, noise_strength, use_offset_noise=False):
 
 
 def should_sample(global_step, validation_steps, validation_data):
-    return (global_step % validation_steps == 0 or global_step == 1) \
-        and validation_data.sample_preview
+    return (global_step % validation_steps == 0 or global_step == 1) and validation_data.sample_preview
 
 
 def save_pipe(
@@ -137,8 +87,6 @@ def save_pipe(
         text_encoder,
         vae,
         output_dir,
-        # lora_manager: LoraHandler,
-        # unet_target_replace_module=None,
         is_checkpoint=False,
         save_pretrained_model=True
 ):
@@ -208,15 +156,6 @@ def main(
         lr_warmup_steps: int = 0,
         adam_beta1: float = 0.9,
         adam_beta2: float = 0.999,
-        cache_latents: bool = False,
-        cached_latent_dir=None,
-        # lora_version: LORA_VERSIONS = LORA_VERSIONS[0],
-        lora_bias: str = 'none',
-        use_unet_lora: bool = False,
-        unet_lora_modules: Tuple[str] = ["UNet3DConditionModel"],
-        lora_rank: int = 16,
-        lora_path: str = '',
-        lora_unet_dropout: float = 0.1,
         adam_weight_decay: float = 1e-2,
         adam_epsilon: float = 1e-08,
         max_grad_norm: float = 1.0,
@@ -232,6 +171,8 @@ def main(
         enable_xformers_memory_efficient_attention: bool = True,
         seed: Optional[int] = None,
         logger_type: str = 'tensorboard',
+        add_temporal_attn: bool = False,
+        add_spatial_attn: bool = False,
         **kwargs,
 ):
     *_, config = inspect.getargvalues(inspect.currentframe())
@@ -272,11 +213,13 @@ def main(
         OmegaConf.save(config, os.path.join(output_dir, 'config.yaml'))
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = KarrasDiffusionSchedulers.from_pretrained(pretrained_model_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(pretrained_model_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_path, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(pretrained_model_path, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(pretrained_model_path, subfolder="vae")
-    unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, subfolder="unet")
+    unet = UNet3DConditionModel.from_pretrained_2d(pretrained_model_path, subfolder="unet",
+                                                   add_temporal_attn=add_temporal_attn,
+                                                   add_spatial_attn=add_spatial_attn)
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
@@ -293,9 +236,6 @@ def main(
             unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
-
-    if gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
 
     if scale_lr:
         learning_rate = (
@@ -314,17 +254,6 @@ def main(
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-
-        # Use LoRA if enabled.
-    # lora_manager = LoraHandler(
-    #     version=lora_version,
-    #     use_unet_lora=use_unet_lora,
-    #     unet_replace_modules=unet_lora_modules,
-    #     lora_bias=lora_bias
-    # )
-
-    # unet_lora_params, unet_negation = lora_manager.add_lora_to_model(
-    #     use_unet_lora, unet, lora_manager.unet_replace_modules, lora_unet_dropout, lora_path, r=lora_rank)
 
     optimizer = optimizer_cls(
         unet.parameters(),
@@ -352,19 +281,6 @@ def main(
         batch_size=train_batch_size,
         shuffle=shuffle
     )
-
-    # Latents caching
-    cached_data_loader = handle_cache_latents(
-        cache_latents,
-        output_dir,
-        train_dataloader,
-        train_batch_size,
-        vae,
-        cached_latent_dir
-    )
-
-    if cached_data_loader is not None:
-        train_dataloader = cached_data_loader
 
     # Prepare everything with our `accelerator`.
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -428,16 +344,13 @@ def main(
 
         latents = tensor_to_vae_latent(pixel_values, vae)
 
-        # Get video length
-        video_length = latents.shape[2]
-
         # Sample noise that we'll add to the latents
         use_offset_noise = use_offset_noise and not rescale_schedule
         noise = sample_noise(latents, offset_noise_strength, use_offset_noise)
         bsz = latents.shape[0]
 
         # Sample a random timestep for each video
-        timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
         timesteps = timesteps.long()
 
         # Add noise to the latents according to the noise magnitude at each timestep
@@ -452,16 +365,12 @@ def main(
         # Encode text embeddings
         token_ids = batch['prompt_ids']
 
-        # Assume extra batch dimnesion.
-        if len(token_ids.shape) > 2:
-            token_ids = token_ids[0]
-
         encoder_hidden_states = text_encoder(token_ids)[0]
 
         # Get the target for loss depending on the prediction type
-        if noise_scheduler.prediction_type == "epsilon":
+        if noise_scheduler.config.prediction_type == "epsilon":
             target = noise
-        elif noise_scheduler.prediction_type == "v_prediction":
+        elif noise_scheduler.config.prediction_type == "v_prediction":
             target = noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
             raise ValueError(f"Unknown prediction type {noise_scheduler.prediction_type}")
@@ -522,8 +431,6 @@ def main(
                         text_encoder,
                         vae,
                         output_dir,
-                        # lora_manager,
-                        # unet_lora_modules,
                         is_checkpoint=True,
                         save_pretrained_model=save_pretrained_model
                     )
@@ -534,37 +441,42 @@ def main(
                         with accelerator.autocast():
                             unet.eval()
                             unet_and_text_g_c(unet, False)
-                            # lora_manager.deactivate_lora_train(unet, True)
 
-                            pipeline = TextToVideoPipeline.from_pretrained(
+                            validation_pipeline = TextToVideoPipeline.from_pretrained(
                                 pretrained_model_path,
                                 text_encoder=text_encoder,
                                 vae=vae,
                                 unet=unet
                             )
 
-                            diffusion_scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
-                            pipeline.scheduler = diffusion_scheduler
+                            diffusion_scheduler = DPMSolverMultistepScheduler.from_config(
+                                validation_pipeline.scheduler.config)
+                            validation_pipeline.scheduler = diffusion_scheduler
 
                             prompt = text_prompt if len(validation_data.prompt) <= 0 else validation_data.prompt
 
-                            curr_dataset_name = batch['dataset']
-                            save_filename = f"{global_step}_dataset-{curr_dataset_name}_{prompt}"
+                            save_filename = f"{global_step}_{prompt}"
 
-                            out_file = f"{output_dir}/samples/{save_filename}.mp4"
+                            out_file = f"{out_dir}/samples/{save_filename}.mp4"
+
+                            prompt = [prompt] * validation_data.num_frames
+                            negative_prompt = [''] * validation_data.num_frames
 
                             with torch.no_grad():
-                                video_frames = pipeline(
+                                video_frames = validation_pipeline(
                                     prompt,
                                     width=validation_data.width,
                                     height=validation_data.height,
                                     num_frames=validation_data.num_frames,
                                     num_inference_steps=validation_data.num_inference_steps,
-                                    guidance_scale=validation_data.guidance_scale
-                                ).frames
-                            create_video(video_frames, train_data.get('fps', 8), out_file)
+                                    guidance_scale=validation_data.guidance_scale,
+                                    video_length=validation_data.num_frames,
+                                    negative_prompt=negative_prompt,
+                                    device="cuda",
+                                ).videos
+                            save_videos_grid(video_frames, out_file)
 
-                            del pipeline
+                            del validation_pipeline
                             torch.cuda.empty_cache()
 
                     logger.info(f"Saved a new sample to {out_file}")
@@ -574,8 +486,6 @@ def main(
                         gradient_checkpointing,
                     )
 
-                    # lora_manager.deactivate_lora_train(unet, False)
-
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             accelerator.log({"training_loss": loss.detach().item()}, step=step)
             progress_bar.set_postfix(**logs)
@@ -583,26 +493,25 @@ def main(
             if global_step >= max_train_steps:
                 break
         # Create the pipeline using the trained modules and save it.
-        accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            save_pipe(
-                pretrained_model_path,
-                global_step,
-                accelerator,
-                unet,
-                text_encoder,
-                vae,
-                output_dir,
-                # lora_manager,
-                # unet_lora_modules,
-                is_checkpoint=False,
-                save_pretrained_model=save_pretrained_model
-            )
-        accelerator.end_training()
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        save_pipe(
+            pretrained_model_path,
+            global_step,
+            accelerator,
+            unet,
+            text_encoder,
+            vae,
+            output_dir,
+            is_checkpoint=False,
+            save_pretrained_model=save_pretrained_model
+        )
+    accelerator.end_training()
 
-    if __name__ == "__main__":
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--config", type=str, default="./configs/my_config.yaml")
-        args = parser.parse_args()
 
-        main(**OmegaConf.load(args.config))
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="./config/config.yaml")
+    args = parser.parse_args()
+
+    main(**OmegaConf.load(args.config))

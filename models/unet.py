@@ -1,22 +1,22 @@
+import json
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
-import os
-import json
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import UNet2DConditionLoadersMixin
 from diffusers.utils import BaseOutput, logging
-from diffusers.models.cross_attention import AttnProcessor
+from diffusers.models.attention_processor import AttnProcessor
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, DownBlock2D, CrossAttnUpBlock2D, UpBlock2D, \
-    get_down_block, get_up_block
-from mid_resnet3d import InflatedConv3d
-from unet_blocks import UNetMidBlock3DCrossAttn
+from .mid_attention3d import TransformerTemporalModel
+from .unet_blocks import UNetMidBlock3DCrossAttn, CrossAttnDownBlock3D, CrossAttnUpBlock3D, DownBlock3D, UpBlock3D, \
+    get_down_block, get_up_block, transformer_g_c
+from .mid_resnet3d import InflatedConv3d
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -38,14 +38,14 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             flip_sin_to_cos: bool = True,
             freq_shift: int = 0,
             down_block_types: Tuple[str] = (
-                    "CrossAttnDownBlock2D",
-                    "CrossAttnDownBlock2D",
-                    "CrossAttnDownBlock2D",
-                    "DownBlock2D",
+                    "CrossAttnDownBlock3D",
+                    "CrossAttnDownBlock3D",
+                    "CrossAttnDownBlock3D",
+                    "DownBlock3D",
             ),
             mid_block_type: Optional[str] = "UNetMidBlock3DCrossAttn",
             up_block_types: Tuple[str] = (
-                    "UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D"),
+                    "UpBlock3D", "CrossAttnUpBlock3D", "CrossAttnUpBlock3D", "CrossAttnUpBlock3D"),
             only_cross_attention: Union[bool, Tuple[bool]] = False,
             block_out_channels: Tuple[int] = (320, 640, 1280, 1280),
             layers_per_block: int = 2,
@@ -66,13 +66,28 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             time_cond_proj_dim: Optional[int] = None,
             conv_in_kernel: int = 3,
             conv_out_kernel: int = 3,
-            add_temp_attn_only_on_upblocks: bool = False,
-            prepend_first_frame: bool = False,
-            add_temp_embed: bool = False,
-            add_temp_conv: bool = False,
+            add_temporal_attn: bool = False,
+            add_spatial_attn: bool = False,
     ):
         super().__init__()
         self.sample_size = sample_size
+        self.gradient_checkpointing = False
+
+        # Check inputs
+        if len(down_block_types) != len(up_block_types):
+            raise ValueError(
+                f"Must provide the same number of `down_block_types` as `up_block_types`. `down_block_types`: {down_block_types}. `up_block_types`: {up_block_types}."
+            )
+
+        if len(block_out_channels) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `block_out_channels` as `down_block_types`. `block_out_channels`: {block_out_channels}. `down_block_types`: {down_block_types}."
+            )
+
+        if not isinstance(attention_head_dim, int) and len(attention_head_dim) != len(down_block_types):
+            raise ValueError(
+                f"Must provide the same number of `attention_head_dim` as `down_block_types`. `attention_head_dim`: {attention_head_dim}. `down_block_types`: {down_block_types}."
+            )
 
         # input
         conv_in_padding = (conv_in_kernel - 1) // 2
@@ -84,12 +99,20 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         time_embed_dim = block_out_channels[0] * 4
         self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
         timestep_input_dim = block_out_channels[0]
+
         self.time_embedding = TimestepEmbedding(
             timestep_input_dim,
             time_embed_dim,
             act_fn=act_fn,
             post_act_fn=timestep_post_act,
             cond_proj_dim=time_cond_proj_dim,
+        )
+
+        self.transformer_in = TransformerTemporalModel(
+            num_attention_heads=8,
+            attention_head_dim=attention_head_dim,
+            in_channels=block_out_channels[0],
+            num_layers=1,
         )
 
         # class embedding
@@ -103,6 +126,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             self.class_embedding = None
 
         self.down_blocks = nn.ModuleList([])
+        self.mid_block = None
         self.up_blocks = nn.ModuleList([])
 
         if isinstance(only_cross_attention, bool):
@@ -154,10 +178,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 dual_cross_attention=dual_cross_attention,
                 use_linear_projection=use_linear_projection,
                 upcast_attention=upcast_attention,
-                add_temp_attn=not add_temp_attn_only_on_upblocks,
-                prepend_first_frame=prepend_first_frame,
-                add_temp_embed=add_temp_embed,
-                add_temp_conv=add_temp_conv,
+                add_spatial_attn=add_spatial_attn,
+                add_temporal_attn=add_temporal_attn,
             )
         else:
             raise ValueError(f"unknown mid_block_type : {mid_block_type}")
@@ -336,9 +358,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         for module in self.children():
             fn_recursive_set_attention_slice(module, reversed_slice_size)
 
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (CrossAttnDownBlock2D, DownBlock2D, CrossAttnUpBlock2D, UpBlock2D)):
-            module.gradient_checkpointing = value
+    def _set_gradient_checkpointing(self, value=False):
+        self.gradient_checkpointing = value
+        self.mid_block.gradient_checkpointing = value
+        for module in self.down_blocks + self.up_blocks:
+            if isinstance(module, (CrossAttnDownBlock3D, DownBlock3D, CrossAttnUpBlock3D, UpBlock3D)):
+                module.gradient_checkpointing = value
 
     def forward(
             self,
@@ -349,8 +374,6 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             timestep_cond: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-            down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
-            mid_block_additional_residual: Optional[torch.Tensor] = None,
             return_dict: bool = True,
     ) -> Union[UNet3DConditionOutput, Tuple]:
         r"""
@@ -407,8 +430,8 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             timesteps = timesteps[None].to(sample.device)
 
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+        num_frames = sample.shape[2]
         timesteps = timesteps.expand(sample.shape[0])
-
         t_emb = self.time_proj(timesteps)
 
         # timesteps does not contain any weights and will always return f32 tensors
@@ -430,6 +453,12 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         # 2. pre-process
         sample = self.conv_in(sample)
 
+        if num_frames > 1:
+            if self.gradient_checkpointing:
+                sample = transformer_g_c(self.transformer_in, sample)
+            else:
+                sample = self.transformer_in(sample).sample
+
         # 3. down
         down_block_res_samples = (sample,)
         for downsample_block in self.down_blocks:
@@ -446,6 +475,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
             down_block_res_samples += res_samples
 
+
         # 4. mid
         sample = self.mid_block(
             sample,
@@ -454,6 +484,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             attention_mask=attention_mask,
             cross_attention_kwargs=cross_attention_kwargs,
         )
+
 
         # 5. up
         for i, upsample_block in enumerate(self.up_blocks):
@@ -493,7 +524,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         return UNet3DConditionOutput(sample=sample)
 
     @classmethod
-    def from_pretrained_2d(cls, pretrained_model_path, subfolder=None):
+    def from_pretrained_2d(cls, pretrained_model_path, subfolder=None, **kwargs):
         if subfolder is not None:
             pretrained_model_path = os.path.join(pretrained_model_path, subfolder)
 
@@ -504,27 +535,32 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             config = json.load(f)
         config["_class_name"] = cls.__name__
         config["down_block_types"] = [
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "CrossAttnDownBlock2D",
-            "DownBlock2D"
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "CrossAttnDownBlock3D",
+            "DownBlock3D"
         ]
         config["up_block_types"] = [
-            "UpBlock2D",
-            "CrossAttnUpBlock2D",
-            "CrossAttnUpBlock2D",
-            "CrossAttnUpBlock2D"
+            "UpBlock3D",
+            "CrossAttnUpBlock3D",
+            "CrossAttnUpBlock3D",
+            "CrossAttnUpBlock3D"
         ]
 
         from diffusers.utils import WEIGHTS_NAME
-        model = cls.from_config(config)
+        model = cls.from_config(
+            config,
+            add_temporal_attn=kwargs.get("add_temporal_attn", False),
+            add_spatial_attn=kwargs.get("add_spatial_attn", False),
+        )
+
         model_file = os.path.join(pretrained_model_path, WEIGHTS_NAME)
         if not os.path.isfile(model_file):
             raise RuntimeError(f"{model_file} does not exist")
+
         state_dict = torch.load(model_file, map_location="cpu")
         for k, v in model.state_dict().items():
-            if '_temp.' in k:
-                state_dict.update({k: v})
-        model.load_state_dict(state_dict)
+            state_dict.update({k: v})
+        model.load_state_dict(state_dict, strict=False)
 
         return model

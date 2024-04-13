@@ -6,12 +6,11 @@ import torch
 from einops import rearrange
 from torch import cuda
 
-from diffusers import UNet2DConditionModel
+from models.unet import UNet3DConditionModel
 from diffusers.schedulers import DDIMScheduler
 from text_to_video_pipeline import TextToVideoPipeline
 
 import utils
-import gradio_utils
 import os
 
 on_huggingspace = os.environ.get("SPACE_AUTHOR_NAME") == "PAIR"
@@ -121,7 +120,7 @@ class Model:
 
     def process_text2video(self,
                            prompt,
-                           model_name="runwayml/stable-diffusion-v1-5",
+                           model_name="pretrained_model_path/models--CompVis--stable-diffusion-v1-4",
                            motion_field_strength_x=12,
                            motion_field_strength_y=12,
                            t0=44,
@@ -129,7 +128,7 @@ class Model:
                            n_prompt="",
                            chunk_size=8,
                            video_length=8,
-                           watermark='Picsart AI Research',
+                           watermark='Rez',
                            merging_ratio=0.0,
                            seed=0,
                            resolution=512,
@@ -142,7 +141,7 @@ class Model:
         print("Module Text2Video")
         if self.model_type != ModelType.Text2Video or model_name != self.model_name:
             print("Model update")
-            unet = UNet2DConditionModel.from_pretrained(  # SD中的unet模块
+            unet = UNet3DConditionModel.from_pretrained(  # SD中的unet模块
                 model_name, subfolder="unet")
             self.set_model(ModelType.Text2Video,  # 跳转到set model函数
                            model_id=model_name, unet=unet)
@@ -151,6 +150,7 @@ class Model:
             if use_cf_attn:
                 self.pipe.unet.set_attn_processor(  # 修改unet中的attention
                     processor=self.text2video_attn_proc)
+                print(self.pipe.unet)
         self.generator.manual_seed(seed)  # 生成随机种子
 
         added_prompt = "high quality, HD, 8K, trending on artstation, high focus, dramatic lighting"
@@ -187,7 +187,7 @@ class Model:
                                 split_to_chunks=True,
                                 chunk_size=chunk_size,
                                 )
-        return utils.create_video(result, fps, path=path, watermark=gradio_utils.logo_name_to_path(watermark))  # 生成视频
+        return utils.save_videos_grid(result, fps, path=path)  # 生成视频
 
 
 class CrossFrameAttnProcessor:

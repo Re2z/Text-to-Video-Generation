@@ -4,25 +4,29 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
 import numpy as np
 from diffusers.utils import BaseOutput
-from einops import rearrange, repeat
+from einops import rearrange
 from torch.nn.functional import grid_sample
 import torchvision.transforms as T
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from diffusers.models import AutoencoderKL
-from diffusers.schedulers import KarrasDiffusionSchedulers
+from diffusers.schedulers import (
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    LMSDiscreteScheduler,
+    PNDMScheduler,
+)
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from models.unet import UNet3DConditionModel
-import PIL
-from PIL import Image
-from kornia.morphology import dilation
 
 
 @dataclass
 class TextToVideoPipelineOutput(BaseOutput):
-    # videos: Union[torch.Tensor, np.ndarray]
+    videos: Union[torch.Tensor, np.ndarray]
     # code: Union[torch.Tensor, np.ndarray]
-    images: Union[List[PIL.Image.Image], np.ndarray]
-    nsfw_content_detected: Optional[List[bool]]
+    # images: Union[List[PIL.Image.Image], np.ndarray]
+    # nsfw_content_detected: Optional[List[bool]]
 
 
 def coords_grid(batch, ht, wd, device):
@@ -40,7 +44,14 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             text_encoder: CLIPTextModel,
             tokenizer: CLIPTokenizer,
             unet: UNet3DConditionModel,
-            scheduler: KarrasDiffusionSchedulers,
+            scheduler: Union[
+                DDIMScheduler,
+                PNDMScheduler,
+                LMSDiscreteScheduler,
+                EulerDiscreteScheduler,
+                EulerAncestralDiscreteScheduler,
+                DPMSolverMultistepScheduler,
+            ],
             safety_checker: StableDiffusionSafetyChecker,
             feature_extractor: CLIPFeatureExtractor,
             requires_safety_checker: bool = True,
@@ -49,7 +60,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
                          safety_checker, feature_extractor, requires_safety_checker)
 
     def DDPM_forward(self, x0, t0, tMax, generator, device, shape, text_embeddings):
-        rand_device = "cpu" if device.type == "mps" else device
+        rand_device = "cpu" if device == "mps" else device
 
         if x0 is None:
             return torch.randn(shape, generator=generator, device=rand_device, dtype=text_embeddings.dtype).to(device)
@@ -73,7 +84,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             )
 
         if latents is None:
-            rand_device = "cpu" if device.type == "mps" else device
+            rand_device = "cpu" if device == "mps" else device
 
             if isinstance(generator, list):
                 shape = (1,) + shape[1:]
@@ -87,6 +98,8 @@ class TextToVideoPipeline(StableDiffusionPipeline):
                 latents = torch.randn(
                     shape, generator=generator, device=rand_device, dtype=dtype).to(device)
         else:
+            if latents.shape != shape:
+                raise ValueError(f"Unexpected latents shape, got {latents.shape}, expected {shape}")
             latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
@@ -124,8 +137,6 @@ class TextToVideoPipeline(StableDiffusionPipeline):
 
         f = latents_local.shape[2]
 
-        latents_local = rearrange(latents_local, "b c f w h -> (b f) c w h")
-
         latents = latents_local.detach().clone()
         x_t0_1 = None
         x_t1_1 = None
@@ -146,30 +157,32 @@ class TextToVideoPipeline(StableDiffusionPipeline):
                     [latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t)
-
                 # predict the noise residual
-                with torch.no_grad():
-                    if null_embs is not None:
-                        text_embeddings[0] = null_embs[i][0]
-                    te = torch.cat([repeat(text_embeddings[0, :, :], "c k -> f c k", f=f),
-                                    repeat(text_embeddings[1, :, :], "c k -> f c k", f=f)])
-                    noise_pred = self.unet(
-                        latent_model_input, t, encoder_hidden_states=te).sample.to(dtype=latents_dtype)
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(
+                    dtype=latents_dtype)
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(
-                        2)
-                    noise_pred = noise_pred_uncond + guidance_scale * \
-                                 (noise_pred_text - noise_pred_uncond)
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                if i >= guidance_stop_step * len(timesteps):
-                    alpha = 0
+                bsz, channel, frames, width, height = latents.shape
+                latents = latents.permute(0, 2, 1, 3, 4).reshape(
+                    bsz * frames, channel, width, height
+                )
+                noise_pred = noise_pred.permute(0, 2, 1, 3, 4).reshape(
+                    bsz * frames, channel, width, height
+                )
+
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs).prev_sample
-                # latents = latents - alpha * grads / (torch.norm(grads) + 1e-10)
-                # call the callback, if provided
+
+                latents = (
+                    latents[None, :]
+                    .reshape(bsz, frames, channel, width, height)
+                    .permute(0, 2, 1, 3, 4)
+                )
 
                 if i < len(timesteps) - 1 and timesteps[i + 1] == t0:
                     x_t0_1 = latents.detach().clone()
@@ -183,14 +196,10 @@ class TextToVideoPipeline(StableDiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        latents = rearrange(latents, "(b f) c w h -> b c f  w h", f=f)
-
         res = {"x0": latents.detach().clone()}
         if x_t0_1 is not None:
-            x_t0_1 = rearrange(x_t0_1, "(b f) c w h -> b c f  w h", f=f)
             res["x_t0_1"] = x_t0_1.detach().clone()
         if x_t1_1 is not None:
-            x_t1_1 = rearrange(x_t1_1, "(b f) c w h -> b c f  w h", f=f)
             res["x_t1_1"] = x_t1_1.detach().clone()
         return res
 
@@ -252,10 +261,9 @@ class TextToVideoPipeline(StableDiffusionPipeline):
                 int, int, torch.FloatTensor], None]] = None,
             callback_steps: Optional[int] = 1,
             use_motion_field: bool = True,  #
-            smooth_bg: bool = False,  #
-            smooth_bg_strength: float = 0.4,  #
             t0: int = 44,  #
-            t1: int = 47,  #
+            t1: int = 46,  #
+            device: Optional[str] = "cpu",
             **kwargs,
     ):
         frame_ids = kwargs.pop("frame_ids", list(range(video_length)))
@@ -287,16 +295,15 @@ class TextToVideoPipeline(StableDiffusionPipeline):
 
         # 2. Define call parameters
         batch_size = 1 if isinstance(prompt, str) else len(prompt)
-        device = self._execution_device
+        device = device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
-        text_embeddings = self._encode_prompt(
-            prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
-        )
+        text_embeddings = self._encode_prompt(prompt, device, num_videos_per_prompt, do_classifier_free_guidance,
+                                              negative_prompt)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -305,12 +312,12 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         # print(f" Latent shape = {latents.shape}")
 
         # 5. Prepare latent variables
-        num_channels_latents = self.unet.in_channels
+        num_channels_latents = self.unet.config.in_channels
 
         xT = self.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
-            1,
+            video_length,
             height,
             width,
             text_embeddings.dtype,
@@ -338,9 +345,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
                 )
                 xT = torch.cat([xT, xT_missing], dim=2)
 
-        xInit = xT.clone()
-
-        timesteps_ddpm = [981, 961, 941, 921, 901, 881, 861, 841, 821, 801, 781, 761, 741, 721,
+        timesteps_ddpm = [979, 959, 939, 919, 899, 879, 859, 829, 819, 799, 781, 761, 741, 721,
                           701, 681, 661, 641, 621, 601, 581, 561, 541, 521, 501, 481, 461, 441,
                           421, 401, 381, 361, 341, 321, 301, 281, 261, 241, 221, 201, 181, 161,
                           141, 121, 101, 81, 61, 41, 21, 1]
@@ -356,8 +361,7 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # 7. Denoising loop
-        num_warmup_steps = len(timesteps) - \
-                           num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         shape = (batch_size, num_channels_latents, 1, height //
                  self.vae_scale_factor, width // self.vae_scale_factor)
@@ -420,83 +424,6 @@ class TextToVideoPipeline(StableDiffusionPipeline):
             x_t0_k = x_t0_1[:, :, 1:, :, :].clone()
             x_t0_1 = x_t0_1[:, :, :1, :, :].clone()
 
-        # smooth background
-        if smooth_bg:
-            h, w = x0.shape[3], x0.shape[4]
-            M_FG = torch.zeros((batch_size, video_length, h, w),
-                               device=x0.device).to(x0.dtype)
-            for batch_idx, x0_b in enumerate(x0):
-                z0_b = self.decode_latents(x0_b[None]).detach()
-                z0_b = rearrange(z0_b[0], "c f h w -> f h w c")
-                for frame_idx, z0_f in enumerate(z0_b):
-                    z0_f = torch.round(
-                        z0_f * 255).cpu().numpy().astype(np.uint8)
-                    # apply SOD detection
-                    m_f = torch.tensor(self.sod_model.process_data(
-                        z0_f), device=x0.device).to(x0.dtype)
-                    mask = T.Resize(
-                        size=(h, w), interpolation=T.InterpolationMode.NEAREST)(m_f[None])
-                    kernel = torch.ones(5, 5, device=x0.device, dtype=x0.dtype)
-                    mask = dilation(mask[None].to(x0.device), kernel)[0]
-                    M_FG[batch_idx, frame_idx, :, :] = mask
-
-            x_t1_1_fg_masked = x_t1_1 * \
-                               (1 - repeat(M_FG[:, 0, :, :],
-                                           "b w h -> b c 1 w h", c=x_t1_1.shape[1]))
-
-            x_t1_1_fg_masked_moved = []
-            for batch_idx, x_t1_1_fg_masked_b in enumerate(x_t1_1_fg_masked):
-                x_t1_fg_masked_b = x_t1_1_fg_masked_b.clone()
-
-                x_t1_fg_masked_b = x_t1_fg_masked_b.repeat(
-                    1, video_length - 1, 1, 1)
-                if use_motion_field:
-                    x_t1_fg_masked_b = x_t1_fg_masked_b[None]
-                    x_t1_fg_masked_b = self.warp_latents_independently(
-                        x_t1_fg_masked_b, reference_flow)
-                else:
-                    x_t1_fg_masked_b = x_t1_fg_masked_b[None]
-
-                x_t1_fg_masked_b = torch.cat(
-                    [x_t1_1_fg_masked_b[None], x_t1_fg_masked_b], dim=2)
-                x_t1_1_fg_masked_moved.append(x_t1_fg_masked_b)
-
-            x_t1_1_fg_masked_moved = torch.cat(x_t1_1_fg_masked_moved, dim=0)
-
-            M_FG_1 = M_FG[:, :1, :, :]
-
-            M_FG_warped = []
-            for batch_idx, m_fg_1_b in enumerate(M_FG_1):
-                m_fg_1_b = m_fg_1_b[None, None]
-                m_fg_b = m_fg_1_b.repeat(1, 1, video_length - 1, 1, 1)
-                if use_motion_field:
-                    m_fg_b = self.warp_latents_independently(
-                        m_fg_b.clone(), reference_flow)
-                M_FG_warped.append(
-                    torch.cat([m_fg_1_b[:1, 0], m_fg_b[:1, 0]], dim=1))
-
-            M_FG_warped = torch.cat(M_FG_warped, dim=0)
-
-            channels = x0.shape[1]
-
-            M_BG = (1 - M_FG) * (1 - M_FG_warped)
-            M_BG = repeat(M_BG, "b f h w -> b c f h w", c=channels)
-            a_convex = smooth_bg_strength
-
-            latents = (1 - M_BG) * x_t1 + M_BG * (a_convex *
-                                                  x_t1 + (1 - a_convex) * x_t1_1_fg_masked_moved)
-
-            ddim_res = self.DDIM_backward(num_inference_steps=num_inference_steps, timesteps=timesteps, skip_t=t1,
-                                          t0=-1, t1=-1, do_classifier_free_guidance=do_classifier_free_guidance,
-                                          null_embs=null_embs, text_embeddings=text_embeddings, latents_local=latents,
-                                          latents_dtype=dtype, guidance_scale=guidance_scale,
-                                          guidance_stop_step=guidance_stop_step, callback=callback,
-                                          callback_steps=callback_steps, extra_step_kwargs=extra_step_kwargs,
-                                          num_warmup_steps=num_warmup_steps)
-            x0 = ddim_res["x0"].detach()
-            del ddim_res
-            del latents
-
         latents = x0
 
         # manually for max memory savings
@@ -505,21 +432,15 @@ class TextToVideoPipeline(StableDiffusionPipeline):
         torch.cuda.empty_cache()
 
         if output_type == "latent":
-            image = latents
-            has_nsfw_concept = None
+            video = latents
         else:
-            image = self.decode_latents(latents)
-
-            # Run safety checker
-            image, has_nsfw_concept = self.run_safety_checker(
-                image, device, text_embeddings.dtype)
-            image = rearrange(image, "b c f h w -> (b f) h w c")
+            video = self.decode_latents(latents)
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
             self.final_offload_hook.offload()
 
         if not return_dict:
-            return (image, has_nsfw_concept)
+            return (video,)
 
-        return TextToVideoPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return TextToVideoPipelineOutput(videos=video)

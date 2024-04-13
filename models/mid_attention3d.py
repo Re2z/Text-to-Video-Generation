@@ -1,19 +1,19 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 from torch import nn
-from modules import get_sin_pos_embedding
-from utils import zero_module
 from einops import rearrange, repeat
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models import ModelMixin
-from diffusers.models.attention import FeedForward, AdaLayerNorm, AdaLayerNormZero
-from diffusers.models.cross_attention import CrossAttention
+from diffusers.models.attention import FeedForward, AdaLayerNorm
+from diffusers.models.attention_processor import Attention
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
-from models.mid_spatial_attention import SpatialAttention
+from .utils import zero_module
+from .modules import get_sin_pos_embedding
+from .mid_spatial_attention import SpatialAttention
 
 if is_xformers_available():
     import xformers
@@ -38,70 +38,87 @@ class BasicTransformerBlock(nn.Module):
             norm_elementwise_affine: bool = True,
             norm_type: str = "layer_norm",
             final_dropout: bool = False,
-            add_temp_embed: bool = False,
+            add_temporal_attn: bool = False,
             add_spatial_attn: bool = False,
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
         self.use_ada_layer_norm = (num_embeds_ada_norm is not None) and norm_type == "ada_norm"
 
-        self.add_temp_embed = add_temp_embed
+        self.add_temporal_attn = add_temporal_attn
         self.add_spatial_attn = add_spatial_attn
 
-        # SC-Attn
-        self.attn1 = SparseCausalAttention(
-            query_dim=dim,
-            cross_attention_dim=cross_attention_dim
-            if only_cross_attention
-            else None,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=attention_bias,
-            upcast_attention=upcast_attention,
-        )
+        if add_temporal_attn:
+            # SC-Attn
+            self.attn1 = SparseCausalAttention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim
+                if only_cross_attention
+                else None,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                upcast_attention=upcast_attention,
+            )
+            # Temp-Attn
+            self.temp_norm = (
+                AdaLayerNorm(dim, num_embeds_ada_norm)
+                if self.use_ada_layer_norm
+                else nn.LayerNorm(dim)
+            )
+
+            self.temp_attn = Attention(
+                query_dim=dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                upcast_attention=upcast_attention,
+            )
+            zero_module(self.temp_attn.to_out)
+        else:
+            # Normal Attention
+            self.attn1 = Attention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim
+                if only_cross_attention
+                else None,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                upcast_attention=upcast_attention,
+            )
+            self.temp_attn = None
 
         # Spatial-Attn
-        self.spatial_norm = (
-            AdaLayerNorm(dim, num_embeds_ada_norm)
-            if self.use_ada_layer_norm
-            else nn.LayerNorm(dim)
-        )
-        self.spatial_attn = SpatialAttention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=attention_bias,
-            upcast_attention=upcast_attention,
-        )
-        zero_module(self.spatial_attn.to_out)
-
-        # Temp-Attn
-        self.temp_norm = (
-            AdaLayerNorm(dim, num_embeds_ada_norm)
-            if self.use_ada_layer_norm
-            else nn.LayerNorm(dim)
-        )
-
-        self.temp_attn = CrossAttention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=attention_bias,
-            upcast_attention=upcast_attention,
-        )
-        zero_module(self.temp_attn.to_out)
+        if add_spatial_attn:
+            self.spatial_norm = (
+                AdaLayerNorm(dim, num_embeds_ada_norm)
+                if self.use_ada_layer_norm
+                else nn.LayerNorm(dim)
+            )
+            self.spatial_attn = SpatialAttention(
+                query_dim=dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                upcast_attention=upcast_attention,
+            )
+            zero_module(self.spatial_attn.to_out)
+        else:
+            self.spatial_attn = None
 
         if self.use_ada_layer_norm:
             self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm)
         else:
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
 
-            # 2. Cross-Attn
+        # 2. Cross-Attn
         if cross_attention_dim is not None:
-            self.attn2 = CrossAttention(
+            self.attn2 = Attention(
                 query_dim=dim,
                 cross_attention_dim=cross_attention_dim,
                 heads=num_attention_heads,
@@ -129,6 +146,49 @@ class BasicTransformerBlock(nn.Module):
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
 
+    def set_use_memory_efficient_attention_xformers(
+            self,
+            use_memory_efficient_attention_xformers: bool,
+            attention_op: Optional[Callable] = None,
+    ):
+        if not is_xformers_available():
+            print("Here is how to install it")
+            raise ModuleNotFoundError(
+                "Refer to https://github.com/facebookresearch/xformers for more information on how to install"
+                " xformers",
+                name="xformers",
+            )
+        elif not torch.cuda.is_available():
+            raise ValueError(
+                "torch.cuda.is_available() should be True but is False. xformers' memory efficient attention is only"
+                " available for GPU "
+            )
+        else:
+            try:
+                # Make sure we can run the memory efficient attention
+                xformers.ops.memory_efficient_attention(
+                    torch.randn((1, 2, 40), device="cuda"),
+                    torch.randn((1, 2, 40), device="cuda"),
+                    torch.randn((1, 2, 40), device="cuda"),
+                )
+            except Exception as e:
+                raise e
+            self.attn1.set_use_memory_efficient_attention_xformers(
+                use_memory_efficient_attention_xformers, attention_op=attention_op
+            )
+            if self.attn2 is not None:
+                self.attn2.set_use_memory_efficient_attention_xformers(
+                    use_memory_efficient_attention_xformers, attention_op=attention_op
+                )
+            if self.temp_attn is not None:
+                self.temp_attn.set_use_memory_efficient_attention_xformers(
+                    use_memory_efficient_attention_xformers, attention_op=attention_op
+                )
+            if self.spatial_attn is not None:
+                self.spatial_attn.set_use_memory_efficient_attention_xformers(
+                    use_memory_efficient_attention_xformers, attention_op=attention_op
+                )
+
     def forward(
             self,
             hidden_states,
@@ -136,8 +196,6 @@ class BasicTransformerBlock(nn.Module):
             timestep=None,
             attention_mask=None,
             cross_attention_kwargs=None,
-            last_frame_hidden_states=None,
-            next_frame_hidden_states=None,
             video_length=None,
     ):
         if self.use_ada_layer_norm:
@@ -146,15 +204,19 @@ class BasicTransformerBlock(nn.Module):
             norm_hidden_states = self.norm1(hidden_states)
 
         # 1. Self-Attention
-        cross_attention_kwargs = cross_attention_kwargs if cross_attention_kwargs is not None else {}
-        if self.temp_attn is not None and isinstance(self.attn1, SparseCausalAttention):
-            cross_attention_kwargs.update({"video_length": video_length})
-        attn_output = self.attn1(
-            norm_hidden_states,
-            encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
-            attention_mask=attention_mask,
-            **cross_attention_kwargs,
-        )
+        if self.add_temporal_attn:
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask,
+                video_length=video_length,
+            )
+        else:
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask,
+            )
 
         hidden_states = attn_output + hidden_states
 
@@ -168,8 +230,8 @@ class BasicTransformerBlock(nn.Module):
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
-                **cross_attention_kwargs,
             )
+
             hidden_states = attn_output + hidden_states
 
         # spatial_attn
@@ -185,9 +247,8 @@ class BasicTransformerBlock(nn.Module):
                 if self.use_ada_layer_norm
                 else self.spatial_norm(hidden_states)
             )
-            # apply temporal attention
-            hidden_states = self.spatial_attn(norm_hidden_states, last_frame_hidden_states,
-                                              next_frame_hidden_states) + hidden_states
+            # apply spatial attention
+            hidden_states = self.spatial_attn(norm_hidden_states) + hidden_states
             hidden_states = rearrange(hidden_states, "(b d) f c -> (b f) d c", d=d)
             # ignore effects of temporal layers on image inputs
             if video_length <= 1:
@@ -197,16 +258,17 @@ class BasicTransformerBlock(nn.Module):
         if self.temp_attn is not None:
             identity = hidden_states
             d = hidden_states.shape[1]
+
             # add temporal embedding
-            if self.add_temp_embed:
-                temp_emb = get_sin_pos_embedding(
-                    hidden_states.shape[-1], video_length
-                ).to(hidden_states)
-                hidden_states = rearrange(
-                    hidden_states, "(b f) d c -> b d f c", f=video_length
-                )
-                hidden_states += temp_emb
-                hidden_states = rearrange(hidden_states, "b d f c -> (b f) d c")
+            temp_emb = get_sin_pos_embedding(
+                hidden_states.shape[-1], video_length
+            ).to(hidden_states)
+            hidden_states = rearrange(
+                hidden_states, "(b f) d c -> b d f c", f=video_length
+            )
+            hidden_states += temp_emb
+            hidden_states = rearrange(hidden_states, "b d f c -> (b f) d c")
+
             # normalization
             hidden_states = rearrange(
                 hidden_states, "(b f) d c -> (b d) f c", f=video_length
@@ -256,8 +318,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             upcast_attention: bool = False,
             norm_type: str = "layer_norm",
             norm_elementwise_affine: bool = True,
-            prepend_first_frame: bool = False,
-            add_temp_embed: bool = False,
+            add_temporal_attn: bool = False,
+            add_spatial_attn: bool = False,
     ):
         super().__init__()
         self.use_linear_projection = use_linear_projection
@@ -289,8 +351,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                     upcast_attention=upcast_attention,
                     norm_type=norm_type,
                     norm_elementwise_affine=norm_elementwise_affine,
-                    prepend_first_frame=prepend_first_frame,
-                    add_temp_embed=add_temp_embed,
+                    add_spatial_attn=add_spatial_attn,
+                    add_temporal_attn=add_temporal_attn,
                 )
                 for _ in range(num_layers)
             ]
@@ -307,8 +369,6 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             self,
             hidden_states,
             encoder_hidden_states=None,
-            last_frame_hidden_states=None,
-            next_frame_hidden_states=None,
             timestep=None,
             class_labels=None,
             cross_attention_kwargs=None,
@@ -324,7 +384,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
             encoder_hidden_states, "b n c -> (b f) n c", f=video_length
         )
 
-        batch, _, height, width = hidden_states.shape
+        batch, channel, height, width = hidden_states.shape
         residual = hidden_states
 
         hidden_states = self.norm(hidden_states)
@@ -343,10 +403,7 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep,
-                last_frame_hidden_states=last_frame_hidden_states,
-                next_frame_hidden_states=next_frame_hidden_states,
                 cross_attention_kwargs=cross_attention_kwargs,
-                class_labels=class_labels,
                 video_length=video_length,
             )
 
@@ -367,7 +424,141 @@ class Transformer3DModel(ModelMixin, ConfigMixin):
         return Transformer3DModelOutput(sample=output)
 
 
-class SparseCausalAttention(CrossAttention):
+@dataclass
+class TransformerTemporalModelOutput(BaseOutput):
+    """
+    Args:
+        sample (`torch.FloatTensor` of shape `(batch_size x num_frames, num_channels, height, width)`)
+            Hidden states conditioned on `encoder_hidden_states` input.
+    """
+
+    sample: torch.FloatTensor
+
+
+class TransformerTemporalModel(ModelMixin, ConfigMixin):
+    """
+    Transformer model for video-like data.
+
+    Parameters:
+        num_attention_heads (`int`, *optional*, defaults to 16): The number of heads to use for multi-head attention.
+        attention_head_dim (`int`, *optional*, defaults to 88): The number of channels in each head.
+        in_channels (`int`, *optional*):
+            Pass if the input is continuous. The number of channels in the input and output.
+        num_layers (`int`, *optional*, defaults to 1): The number of layers of Transformer blocks to use.
+        dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
+        cross_attention_dim (`int`, *optional*): The number of encoder_hidden_states dimensions to use.
+        sample_size (`int`, *optional*): Pass if the input is discrete. The width of the latent images.
+            Note that this is fixed at training time as it is used for learning a number of position embeddings. See
+            `ImagePositionalEmbeddings`.
+        activation_fn (`str`, *optional*, defaults to `"geglu"`): Activation function to be used in feed-forward.
+        attention_bias (`bool`, *optional*):
+            Configure if the TransformerBlocks' attention should contain a bias parameter.
+    """
+
+    @register_to_config
+    def __init__(
+            self,
+            num_attention_heads: int = 16,
+            attention_head_dim: int = 88,
+            in_channels: Optional[int] = None,
+            num_layers: int = 1,
+            dropout: float = 0.0,
+            norm_num_groups: int = 32,
+            cross_attention_dim: Optional[int] = None,
+            attention_bias: bool = False,
+            activation_fn: str = "geglu",
+            norm_elementwise_affine: bool = True,
+    ):
+        super().__init__()
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_dim = attention_head_dim
+        inner_dim = num_attention_heads * attention_head_dim
+
+        self.in_channels = in_channels
+
+        self.norm = torch.nn.GroupNorm(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+        self.proj_in = nn.Linear(in_channels, inner_dim)
+
+        # 3. Define transformers blocks
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock(
+                    inner_dim,
+                    num_attention_heads,
+                    attention_head_dim,
+                    dropout=dropout,
+                    cross_attention_dim=cross_attention_dim,
+                    activation_fn=activation_fn,
+                    attention_bias=attention_bias,
+                    norm_elementwise_affine=norm_elementwise_affine,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.proj_out = nn.Linear(inner_dim, in_channels)
+        self.proj_out = zero_module(self.proj_out)
+
+    def forward(
+            self,
+            hidden_states,
+            encoder_hidden_states=None,
+            timestep=None,
+            return_dict: bool = True,
+    ):
+        """
+        Args:
+            hidden_states ( When discrete, `torch.LongTensor` of shape `(batch size, num latent pixels)`.
+                When continous, `torch.FloatTensor` of shape `(batch size, channel, height, width)`): Input
+                hidden_states
+            encoder_hidden_states ( `torch.LongTensor` of shape `(batch size, encoder_hidden_states dim)`, *optional*):
+                Conditional embeddings for cross attention layer. If not given, cross-attention defaults to
+                self-attention.
+            timestep ( `torch.long`, *optional*):
+                Optional timestep to be applied as an embedding in AdaLayerNorm's. Used to indicate denoising step.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
+
+        Returns:
+            [`~models.transformer_2d.TransformerTemporalModelOutput`] or `tuple`:
+            [`~models.transformer_2d.TransformerTemporalModelOutput`] if `return_dict` is True, otherwise a `tuple`.
+            When returning a tuple, the first element is the sample tensor.
+        """
+        # 1. Input
+        batch_size, channel, num_frames, height, width = hidden_states.shape
+
+        residual = hidden_states
+
+        hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states.permute(0, 3, 4, 2, 1).reshape(batch_size * height * width, num_frames, channel)
+        hidden_states = self.proj_in(hidden_states)
+
+        # 2. Blocks
+        for block in self.transformer_blocks:
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                video_length=num_frames,
+            )
+
+        # 3. Output
+        hidden_states = self.proj_out(hidden_states)
+        hidden_states = (
+            hidden_states[None, None, :]
+            .reshape(batch_size, height, width, channel, num_frames)
+            .permute(0, 3, 4, 1, 2)
+            .contiguous()
+        )
+        output = hidden_states + residual
+
+        if not return_dict:
+            return (output,)
+
+        return TransformerTemporalModelOutput(sample=output)
+
+
+class SparseCausalAttention(Attention):
     def forward(
             self,
             hidden_states,
@@ -377,10 +568,7 @@ class SparseCausalAttention(CrossAttention):
             **cross_attention_kwargs,
     ):
         batch_size, sequence_length, _ = hidden_states.shape
-        video_length = cross_attention_kwargs.get("video_length", 8)
-        attention_mask = self.prepare_attention_mask(
-            attention_mask, sequence_length, batch_size
-        )
+        attention_mask = self.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         query = self.to_q(hidden_states)
         dim = query.shape[-1]
 
@@ -400,16 +588,12 @@ class SparseCausalAttention(CrossAttention):
 
         key = rearrange(key, "(b f) d c -> b f d c", f=video_length)
         if video_length > 1:
-            key = torch.cat(
-                [key[:, [0] * video_length], key[:, former_frame_index]], dim=2
-            )
+            key = torch.cat([key[:, [0] * video_length], key[:, former_frame_index]], dim=2)
         key = rearrange(key, "b f d c -> (b f) d c")
 
         value = rearrange(value, "(b f) d c -> b f d c", f=video_length)
         if video_length > 1:
-            value = torch.cat(
-                [value[:, [0] * video_length], value[:, former_frame_index]], dim=2
-            )
+            value = torch.cat([value[:, [0] * video_length], value[:, former_frame_index]], dim=2)
         value = rearrange(value, "b f d c -> (b f) d c")
 
         query = self.head_to_batch_dim(query)

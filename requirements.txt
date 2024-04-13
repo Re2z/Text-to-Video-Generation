@@ -1,0 +1,17 @@
+numpy
+pillow
+torch
+safetensors
+loralib
+transformers
+diffusers==0.21.1
+einops
+xformers
+tomesd
+omegaconf
+accelerate
+tqdm
+torchvision
+kornia
+decord
+imageio==2.27.0

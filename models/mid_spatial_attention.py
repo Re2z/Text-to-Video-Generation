@@ -89,71 +89,6 @@ class SpatialAttention(nn.Module):
         #     processor = AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") else SpatialAttnProcessor()
         self.set_processor(processor)
 
-    def set_use_memory_efficient_attention_xformers(
-            self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None
-    ):
-        is_lora = False
-
-        if use_memory_efficient_attention_xformers:
-            if self.added_kv_proj_dim is not None:
-                # TODO(Anton, Patrick, Suraj, William) - currently xformers doesn't work for UnCLIP
-                # which uses this type of cross attention ONLY because the attention mask of format
-                # [0, ..., -10.000, ..., 0, ...,] is not supported
-                raise NotImplementedError(
-                    "Memory efficient attention with `xformers` is currently not supported when"
-                    " `self.added_kv_proj_dim` is defined."
-                )
-            elif not is_xformers_available():
-                raise ModuleNotFoundError(
-                    (
-                        "Refer to https://github.com/facebookresearch/xformers for more information on how to install"
-                        " xformers"
-                    ),
-                    name="xformers",
-                )
-            elif not torch.cuda.is_available():
-                raise ValueError(
-                    "torch.cuda.is_available() should be True but is False. xformers' memory efficient attention is"
-                    " only available for GPU "
-                )
-            else:
-                try:
-                    # Make sure we can run the memory efficient attention
-                    _ = xformers.ops.memory_efficient_attention(
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
-                        torch.randn((1, 2, 40), device="cuda"),
-                    )
-                except Exception as e:
-                    raise e
-
-            if is_lora:
-                raise ValueError(f"unknown processor : {self.processor}")
-            else:
-                raise ValueError(f"unknown processor : {self.processor}")
-        else:
-            if is_lora:
-                raise ValueError(f"unknown processor : {self.processor}")
-            else:
-                processor = SpatialAttnProcessor()
-
-        self.set_processor(processor)
-
-    def set_attention_slice(self, slice_size):
-        if slice_size is not None and slice_size > self.sliceable_head_dim:
-            raise ValueError(f"slice_size {slice_size} has to be smaller or equal to {self.sliceable_head_dim}.")
-
-        if slice_size is not None and self.added_kv_proj_dim is not None:
-            raise ValueError(f"unknown processor : {self.processor}")
-        elif slice_size is not None:
-            raise ValueError(f"unknown processor : {self.processor}")
-        elif self.added_kv_proj_dim is not None:
-            raise ValueError(f"unknown processor : {self.processor}")
-        else:
-            processor = SpatialAttnProcessor()
-
-        self.set_processor(processor)
-
     def set_processor(self, processor: "AttnProcessor"):
         # if current processor is in `self._modules` and if passed `processor` is not, we need to
         # pop `processor` from `self._modules`
@@ -168,7 +103,7 @@ class SpatialAttention(nn.Module):
         self.processor = processor
 
     def forward(self, hidden_states, encoder_hidden_states=None, last_frame_hidden_states=None,
-            next_frame_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
+                next_frame_hidden_states=None, attention_mask=None, **cross_attention_kwargs):
         # The `CrossAttention` class can call different attention processors / attention functions
         # here we simply pass along all tensors to the selected processor class
         # For standard processors that are defined here, `**cross_attention_kwargs` is empty
@@ -176,8 +111,6 @@ class SpatialAttention(nn.Module):
             self,
             hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            last_frame_hidden_states=last_frame_hidden_states,
-            next_frame_hidden_states=next_frame_hidden_states,
             attention_mask=attention_mask,
             **cross_attention_kwargs,
         )
@@ -264,34 +197,33 @@ class SpatialAttnProcessor:
             self,
             attn: SpatialAttention,
             hidden_states,
-            last_frame_hidden_states=None,
-            next_frame_hidden_states=None,
             encoder_hidden_states=None,
             attention_mask=None,
     ):
         batch_size, sequence_length, _ = hidden_states.shape
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif self.cross_attention_norm:
+            encoder_hidden_states = self.norm_cross(encoder_hidden_states)
+
         query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
 
-        last_frame_encoder_hidden_states = last_frame_hidden_states
-        next_frame_encoder_hidden_states = next_frame_hidden_states
+        video_length = key.size()[0]
+        former_frame_index = torch.arange(video_length) - 1
+        former_frame_index[0] = 0
 
-        if last_frame_hidden_states is None and next_frame_hidden_states is None:
-            key = attn.to_k(encoder_hidden_states)
-            value = attn.to_v(encoder_hidden_states)
-            video_length = key.size()[0] // self.unet_chunk_size
-            # former_frame_index = torch.arange(video_length) - 1
-            # former_frame_index[0] = 0
-            former_frame_index = [0] * video_length
-            key = rearrange(key, "(b f) d c -> b f d c", f=video_length)
-            key = key[:, former_frame_index]
-            key = rearrange(key, "b f d c -> (b f) d c")
-            value = rearrange(value, "(b f) d c -> b f d c", f=video_length)
-            value = value[:, former_frame_index]
-            value = rearrange(value, "b f d c -> (b f) d c")
-        else:
-            key = attn.to_k(last_frame_encoder_hidden_states)
-            value = attn.to_v(next_frame_encoder_hidden_states)
+        key = rearrange(key, "(b f) d c -> b f d c", f=video_length)
+        if video_length > 1:
+            key = torch.cat([key[:, [0] * video_length], key[:, former_frame_index]], dim=2)
+        key = rearrange(key, "b f d c -> (b f) d c")
+        value = rearrange(value, "(b f) d c -> b f d c", f=video_length)
+        if video_length > 1:
+            value = torch.cat([value[:, [0] * video_length], value[:, former_frame_index]], dim=2)
+        value = rearrange(value, "b f d c -> (b f) d c")
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
